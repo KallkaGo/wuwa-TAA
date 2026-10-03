@@ -1,16 +1,15 @@
 import {
+  Color,
   HalfFloatType,
   Matrix4,
   Mesh,
   NearestFilter,
   NoBlending,
-  OrthographicCamera,
-  PlaneGeometry,
+  PerspectiveCamera,
   Scene,
   ShaderMaterial,
-  Vector2,
   WebGLRenderTarget,
-  type DepthTexture,
+  type Material,
   type Texture,
   type WebGLRenderer,
 } from 'three';
@@ -20,98 +19,86 @@ class VelocityMaterial extends ShaderMaterial {
   constructor() {
     super({
       blending: NoBlending,
-      depthWrite: false,
-      depthTest: false,
+      depthWrite: true,
+      depthTest: true,
+      toneMapped: false,
       uniforms: {
-        tDepth: { value: null },
-        uInvTexSize: { value: new Vector2() },
-        uInvViewProj: { value: new Matrix4() },
-        uPrevViewProj: { value: new Matrix4() },
-        uFirstFrame: { value: 1.0 },
+        uJitteredViewProj: { value: new Matrix4() },
+        uCurrentViewProj: { value: new Matrix4() },
+        uPreviousViewProj: { value: new Matrix4() },
+        uPreviousWorld: { value: new Matrix4() },
+        uHistoryValid: { value: 0.0 },
+        uMotionWriter: { value: 0.0 },
       },
       vertexShader: /* glsl */ `
-        varying vec2 vUv;
+        uniform mat4 uJitteredViewProj;
+        uniform mat4 uCurrentViewProj;
+        uniform mat4 uPreviousViewProj;
+        uniform mat4 uPreviousWorld;
+        varying vec4 vCurrentClip;
+        varying vec4 vPreviousClip;
+
         void main() {
-          vUv = uv;
-          gl_Position = vec4(position.xy, 1.0, 1.0);
+          vec4 localPosition = vec4(position, 1.0);
+          vec4 worldPosition = modelMatrix * localPosition;
+          gl_Position = uJitteredViewProj * worldPosition;
+          vCurrentClip = uCurrentViewProj * worldPosition;
+          vPreviousClip = uPreviousViewProj * uPreviousWorld * localPosition;
         }
       `,
       fragmentShader: /* glsl */ `
-        uniform sampler2D tDepth;
-        uniform vec2 uInvTexSize;
-        uniform mat4 uInvViewProj;
-        uniform mat4 uPrevViewProj;
-        uniform float uFirstFrame;
-
-        varying vec2 vUv;
-
-        vec3 reconstructWorldPos(vec2 uv, float depth) {
-          float z = depth * 2.0 - 1.0;
-          vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
-          vec4 wp = uInvViewProj * clip;
-          return wp.xyz / wp.w;
-        }
+        uniform float uHistoryValid;
+        uniform float uMotionWriter;
+        varying vec4 vCurrentClip;
+        varying vec4 vPreviousClip;
 
         void main() {
-          if (uFirstFrame > 0.5) {
-            gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+          if (uHistoryValid < 0.5 || vCurrentClip.w <= 1e-6 || vPreviousClip.w <= 1e-6) {
+            gl_FragColor = vec4(0.0);
             return;
           }
 
-          float closestDepth = 1.0;
-          vec2 closestUV = vUv;
-
-          for (int x = -1; x <= 1; x++) {
-            for (int y = -1; y <= 1; y++) {
-              vec2 sUV = vUv + vec2(float(x), float(y)) * uInvTexSize;
-              float d = texture2D(tDepth, sUV).r;
-              if (d < closestDepth) {
-                closestDepth = d;
-                closestUV = sUV;
-              }
-            }
-          }
-
-          if (closestDepth >= 1.0) {
-            gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-            return;
-          }
-
-          vec3 wp = reconstructWorldPos(closestUV, closestDepth);
-          vec4 prevClip = uPrevViewProj * vec4(wp, 1.0);
-
-          if (abs(prevClip.w) < 1e-6) {
-            gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-            return;
-          }
-
-          vec2 prevUV = prevClip.xy / prevClip.w * 0.5 + 0.5;
-          vec2 velocity = closestUV - prevUV;
-          gl_FragColor = vec4(velocity, 0.0, 1.0);
+          vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
+          vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
+          // B marks an explicit rigid-object motion writer; the resolver reconstructs camera-only motion.
+          gl_FragColor = vec4(currentUV - previousUV, uMotionWriter, 1.0);
         }
       `,
     });
   }
 }
 
+interface MotionEntry {
+  proxy: Mesh;
+  materials: VelocityMaterial[];
+  previousWorld: Matrix4;
+  hasHistory: boolean;
+  motionWriter: boolean;
+}
+
+/**
+ * Motion for the demo's opaque rigid meshes. Shares geometry without modifying source objects.
+ * Skinning, morphs, instancing and cutouts are skipped; custom vertex deformation is unsupported.
+ * RG is current-minus-previous unjittered UV; B identifies an explicit object-motion writer.
+ * A writer stays valid when it stops moving. Rasterization alone uses the jittered projection.
+ */
 export class VelocityPass extends Pass {
-  private readonly prevViewProj = new Matrix4();
+  private readonly previousViewProj = new Matrix4();
+  private readonly currentViewProj = new Matrix4();
+  private readonly jitteredViewProj = new Matrix4();
   private hasHistory = false;
-  private readonly velocityMat = new VelocityMaterial();
+  private hasFrameData = false;
   private rt: WebGLRenderTarget | null = null;
-
-  private depthTexture: DepthTexture | null = null;
-  private readonly invViewProj = new Matrix4();
-  private readonly currViewProj = new Matrix4();
-
-  private readonly quad = new Mesh(new PlaneGeometry(2, 2), this.velocityMat);
-  private readonly fsScene = new Scene();
-  private readonly fsCam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private readonly motionScene = new Scene();
+  private readonly rasterCamera = new PerspectiveCamera();
+  private readonly entries = new Map<Mesh, MotionEntry>();
+  private readonly clearColor = new Color();
 
   constructor() {
     super('VelocityPass');
     this.needsSwap = false;
-    this.fsScene.add(this.quad);
+    this.rasterCamera.matrixAutoUpdate = false;
+    this.rasterCamera.matrixWorldAutoUpdate = false;
   }
 
   setSize(width: number, height: number): void {
@@ -120,24 +107,108 @@ export class VelocityPass extends Pass {
       minFilter: NearestFilter,
       magFilter: NearestFilter,
       type: HalfFloatType,
-      depthBuffer: false,
+      depthBuffer: true,
+      stencilBuffer: false,
     });
-    (this.velocityMat.uniforms.uInvTexSize.value as Vector2).set(1 / width, 1 / height);
+    this.reset();
   }
 
   get texture(): Texture | null {
-    return this.rt ? this.rt.texture : null;
+    return this.rt?.texture ?? null;
   }
 
   reset(): void {
     this.hasHistory = false;
-    this.prevViewProj.identity();
+    this.hasFrameData = false;
+    this.previousViewProj.identity();
+    for (const entry of this.entries.values()) entry.hasHistory = false;
   }
 
-  setFrameData(depthTexture: DepthTexture, invViewProj: Matrix4, currViewProj: Matrix4): void {
-    this.depthTexture = depthTexture;
-    this.invViewProj.copy(invViewProj);
-    this.currViewProj.copy(currViewProj);
+  // Call after the color render, when source matrixWorld values represent the current frame.
+  setFrameData(
+    scene: Scene,
+    camera: PerspectiveCamera,
+    currentNonJitteredVP: Matrix4,
+    jitteredVP: Matrix4,
+  ): void {
+    this.currentViewProj.copy(currentNonJitteredVP);
+    this.jitteredViewProj.copy(jitteredVP);
+    this.rasterCamera.copy(camera, false);
+    this.rasterCamera.matrixAutoUpdate = false;
+    this.rasterCamera.matrixWorldAutoUpdate = false;
+    // Derive the culling projection from the captured VP, independent of later clearViewOffset().
+    this.rasterCamera.projectionMatrix.multiplyMatrices(jitteredVP, camera.matrixWorld);
+    this.rasterCamera.projectionMatrixInverse.copy(this.rasterCamera.projectionMatrix).invert();
+
+    const activeMeshes = new Set<Mesh>();
+    scene.traverseVisible((object) => {
+      if (!(object instanceof Mesh) || !object.layers.test(camera.layers)) return;
+      const specialized = object as Mesh & { isSkinnedMesh?: boolean; isInstancedMesh?: boolean };
+      if (specialized.isSkinnedMesh || specialized.isInstancedMesh ||
+          Object.keys(object.geometry.morphAttributes).length > 0) return;
+
+      const sourceMaterials = Array.isArray(object.material) ? object.material : [object.material];
+      if (!sourceMaterials.some(isSupportedMaterial)) return;
+      activeMeshes.add(object);
+      let entry = this.entries.get(object);
+      if (!entry) {
+        const proxy = new Mesh(object.geometry, []);
+        proxy.matrixAutoUpdate = false;
+        proxy.matrixWorldAutoUpdate = false;
+        entry = {
+          proxy,
+          materials: [],
+          previousWorld: new Matrix4(),
+          hasHistory: false,
+          motionWriter: object.userData.taaMotionWriter === true,
+        };
+        this.entries.set(object, entry);
+        this.motionScene.add(proxy);
+      }
+
+      while (entry.materials.length > sourceMaterials.length) entry.materials.pop()!.dispose();
+      while (entry.materials.length < sourceMaterials.length) entry.materials.push(new VelocityMaterial());
+      entry.proxy.geometry = object.geometry;
+      entry.proxy.material = Array.isArray(object.material) ? entry.materials : entry.materials[0];
+      entry.proxy.matrix.copy(object.matrixWorld);
+      entry.proxy.matrixWorld.copy(object.matrixWorld);
+      entry.proxy.layers.mask = object.layers.mask;
+      entry.proxy.frustumCulled = object.frustumCulled;
+      entry.proxy.renderOrder = object.renderOrder;
+
+      const validHistory = this.hasHistory && entry.hasHistory;
+      const objectMoved = validHistory && !entry.previousWorld.equals(object.matrixWorld);
+      // Keep a dynamic object's writer identity through stationary frames and history resets.
+      entry.motionWriter ||= objectMoved || object.userData.taaMotionWriter === true;
+      for (let i = 0; i < sourceMaterials.length; i += 1) {
+        const source = sourceMaterials[i];
+        const material = entry.materials[i];
+        material.visible = isSupportedMaterial(source);
+        material.side = source.side;
+        const wireframeSource = source as Material & { wireframe?: boolean; wireframeLinewidth?: number };
+        material.wireframe = wireframeSource.wireframe ?? false;
+        material.wireframeLinewidth = wireframeSource.wireframeLinewidth ?? 1;
+        material.polygonOffset = source.polygonOffset;
+        material.polygonOffsetFactor = source.polygonOffsetFactor;
+        material.polygonOffsetUnits = source.polygonOffsetUnits;
+        material.uniforms.uJitteredViewProj.value.copy(this.jitteredViewProj);
+        material.uniforms.uCurrentViewProj.value.copy(this.currentViewProj);
+        material.uniforms.uPreviousViewProj.value.copy(this.previousViewProj);
+        material.uniforms.uPreviousWorld.value.copy(validHistory ? entry.previousWorld : object.matrixWorld);
+        material.uniforms.uHistoryValid.value = validHistory ? 1.0 : 0.0;
+        material.uniforms.uMotionWriter.value = validHistory && entry.motionWriter ? 1.0 : 0.0;
+      }
+    });
+
+    // Dropping invisible or removed objects also prevents stale motion when they reappear.
+    for (const [source, entry] of this.entries) {
+      if (!activeMeshes.has(source)) {
+        this.motionScene.remove(entry.proxy);
+        for (const material of entry.materials) material.dispose();
+        this.entries.delete(source);
+      }
+    }
+    this.hasFrameData = true;
   }
 
   render(
@@ -147,20 +218,54 @@ export class VelocityPass extends Pass {
     _deltaTime?: number,
     _stencilTest?: boolean,
   ): void {
-    if (!this.rt || !this.depthTexture) {
-      return;
+    if (!this.rt || !this.hasFrameData) return;
+
+    const previousTarget = renderer.getRenderTarget();
+    const cubeFace = renderer.getActiveCubeFace();
+    const mipLevel = renderer.getActiveMipmapLevel();
+    const autoClear = renderer.autoClear;
+    const clearAlpha = renderer.getClearAlpha();
+    const xrEnabled = renderer.xr.enabled;
+    renderer.getClearColor(this.clearColor);
+    try {
+      renderer.autoClear = false;
+      renderer.xr.enabled = false;
+      // The target supplies its own full-size viewport and disabled scissor, including at DPR > 1.
+      renderer.setRenderTarget(this.rt);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear(true, true, false);
+      // Static non-writer meshes write depth and B=0 too, so they occlude moving meshes correctly.
+      renderer.render(this.motionScene, this.rasterCamera);
+    } finally {
+      renderer.setRenderTarget(previousTarget, cubeFace, mipLevel);
+      renderer.setClearColor(this.clearColor, clearAlpha);
+      renderer.autoClear = autoClear;
+      renderer.xr.enabled = xrEnabled;
     }
 
-    this.velocityMat.uniforms.tDepth.value = this.depthTexture;
-    (this.velocityMat.uniforms.uInvViewProj.value as Matrix4).copy(this.invViewProj);
-    (this.velocityMat.uniforms.uPrevViewProj.value as Matrix4).copy(this.prevViewProj);
-    this.velocityMat.uniforms.uFirstFrame.value = this.hasHistory ? 0.0 : 1.0;
-
-    renderer.setRenderTarget(this.rt);
-    renderer.clear(true, false, false);
-    renderer.render(this.fsScene, this.fsCam);
-
-    this.prevViewProj.copy(this.currViewProj);
+    this.previousViewProj.copy(this.currentViewProj);
+    for (const entry of this.entries.values()) {
+      entry.previousWorld.copy(entry.proxy.matrixWorld);
+      entry.hasHistory = true;
+    }
     this.hasHistory = true;
+    this.hasFrameData = false;
   }
+
+  dispose(): void {
+    this.rt?.dispose();
+    this.rt = null;
+    for (const entry of this.entries.values()) {
+      for (const material of entry.materials) material.dispose();
+    }
+    this.entries.clear();
+    this.motionScene.clear();
+    this.hasFrameData = false;
+    // Shared source geometries belong to the original scene and are not disposed here.
+    super.dispose();
+  }
+}
+
+function isSupportedMaterial(material: Material): boolean {
+  return material.visible && !material.transparent && material.alphaTest === 0 && !material.alphaHash;
 }

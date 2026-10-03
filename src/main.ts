@@ -33,7 +33,23 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.05;
 controls.target.set(0, 0, 0);
 
-const { scene, group, cube1, cube2, sphere, torus, wireSphere } = buildTestScene();
+const { scene, group, cube1, cube2, sphere, torus, wireSphere, groundCanvas } = buildTestScene();
+
+// These animated primitives remain velocity writers even while animation is paused.
+for (const mesh of [cube1, cube2, sphere, torus, wireSphere]) mesh.userData.taaMotionWriter = true;
+
+const downloadGroundCanvas = (): void => {
+  const link = document.createElement('a');
+  link.href = groundCanvas.toDataURL('image/png');
+  link.download = 'ground-checkerboard.png';
+  link.click();
+};
+
+window.addEventListener('keydown', (event) => {
+  if (event.key.toLowerCase() === 'g') {
+    downloadGroundCanvas();
+  }
+});
 
 const velocityPass = new VelocityPass();
 const taaEffect = new TAAEffect(scene, camera, velocityPass);
@@ -55,11 +71,6 @@ ui.blendFactor.addEventListener('input', () => {
   ui.blendVal.textContent = taaEffect.blendFactor.toFixed(2);
 });
 
-ui.clipGamma.addEventListener('input', () => {
-  taaEffect.clipGamma = Number.parseFloat(ui.clipGamma.value);
-  ui.clipVal.textContent = taaEffect.clipGamma.toFixed(1);
-});
-
 ui.jitterScale.addEventListener('input', () => {
   taaEffect.jitterScale = Number.parseFloat(ui.jitterScale.value);
   ui.jitterVal.textContent = taaEffect.jitterScale.toFixed(1);
@@ -71,6 +82,10 @@ ui.showVelocity.addEventListener('change', () => {
 
 ui.showDiff.addEventListener('change', () => {
   taaEffect.showDiff = ui.showDiff.checked;
+});
+
+ui.useBicubicHistorySampling.addEventListener('change', () => {
+  taaEffect.useBicubicHistorySampling = ui.useBicubicHistorySampling.checked;
 });
 
 ui.resetHistory.addEventListener('click', () => {

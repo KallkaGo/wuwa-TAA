@@ -1,5 +1,5 @@
 import { BlendFunction, Effect } from 'postprocessing';
-import { Uniform, type PerspectiveCamera, type Scene, type WebGLRenderTarget, type WebGLRenderer } from 'three';
+import { Uniform, type PerspectiveCamera, type Scene, type Texture, type WebGLRenderTarget, type WebGLRenderer } from 'three';
 import type { VelocityPass } from './VelocityPass';
 import { TemporalReprojectPass } from './TemporalReprojectPass';
 
@@ -19,11 +19,13 @@ export class TAAEffect extends Effect {
   private readonly velocityPass: VelocityPass;
 
   taaEnabled = true;
-  blendFactor = 0.05;
-  clipGamma = 1.0;
+  blendFactor = 0.25;
   jitterScale = 1.0;
+  exposure = 1.0;
+  responsiveMask: Texture | null = null;
   showVelocity = false;
   showDiff = false;
+  useBicubicHistorySampling = true;
 
   private temporalReprojectPass: TemporalReprojectPass | null = null;
   private pendingReset = false;
@@ -66,12 +68,14 @@ export class TAAEffect extends Effect {
       this.setSize(inputBuffer.width, inputBuffer.height);
     }
 
-    this.temporalReprojectPass.taaEnabled = this.taaEnabled;
+    this.temporalReprojectPass.setTaaEnabled(this.taaEnabled);
     this.temporalReprojectPass.blendFactor = this.blendFactor;
-    this.temporalReprojectPass.clipGamma = this.clipGamma;
     this.temporalReprojectPass.jitterScale = this.jitterScale;
+    this.temporalReprojectPass.exposure = this.exposure;
+    this.temporalReprojectPass.responsiveMask = this.responsiveMask;
     this.temporalReprojectPass.showVelocity = this.showVelocity;
     this.temporalReprojectPass.showDiff = this.showDiff;
+    this.temporalReprojectPass.setUseBicubicHistorySampling(this.useBicubicHistorySampling);
 
     if (this.pendingReset) {
       this.temporalReprojectPass.reset();
@@ -83,9 +87,12 @@ export class TAAEffect extends Effect {
   }
 
   dispose(): void {
-    super.dispose();
-    this.temporalReprojectPass?.dispose();
+    // Effect.dispose() would also dispose the pass, its velocity child and a
+    // caller-owned responsive texture via a shallow property walk.
+    if (this.temporalReprojectPass) this.temporalReprojectPass.dispose();
+    else this.velocityPass.dispose();
     this.temporalReprojectPass = null;
+    this.uniforms.get('accumulatedTexture')!.value = null;
     this.pendingReset = false;
   }
 

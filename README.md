@@ -1,369 +1,97 @@
-# Simple-TAA
-Three.js 简单 TAA 示例。
+# wuwa TAA
 
-## 实现流程
+参考 **鸣潮（Wuthering Waves）TAA** 实现的 Three.js / WebGL2 示例。
 
-这套实现可以按下面这条线看：
+项目依据鸣潮的 RenderDoc 帧捕获，分析 shader、常量缓冲和跨帧采样行为，在 Web 端复现核心 TAA 流程。运动向量、坐标约定和资源管理针对 Three.js 做了适配。这是基于捕获分析的参考实现，不是游戏官方源码，也不代表鸣潮在所有画质设置下的完整渲染方案。
 
-1. `main.ts` 每帧调用 `composer.render()`。
-2. `EffectPass(camera, taaEffect)` 触发 `TAAEffect.update()`。
-3. `TAAEffect` 把参数传给 `TemporalReprojectPass`，再执行 `render()`。
-4. `TemporalReprojectPass` 负责 jitter、当前帧渲染、速度图、历史融合和 history ping-pong。
-5. `TAAEffect` 读取累计结果，做最终 gamma 输出。
+## 运行
 
----
+```sh
+npm install
+npm run dev
+```
 
-### 1）渲染入口
+打开终端显示的本地地址。页面包含场景动画、TAA 参数和调试视图。
+
+```sh
+npm run build    # TypeScript 检查和生产打包
+npm run preview  # 预览构建结果
+```
+
+需要支持 WebGL2 和浮点渲染目标的浏览器。
+
+## 每帧流程
+
+1. **偏移采样位置。** 按四相位 jitter 修改相机投影，渲染当前帧颜色和深度。
+2. **计算运动向量。** 使用当前帧和上一帧的变换，计算不透明刚体网格的屏幕位移。运动数值不包含 jitter。
+3. **找到历史颜色。** 静态区域使用深度和相机矩阵重投影；有物体运动的区域使用运动向量。通过五次双线性采样的 Catmull–Rom 近似重建历史颜色。
+4. **限制历史颜色。** 将颜色转为 YCoCg，用当前像素及上下左右邻居的颜色范围限制历史。越界、历史重置或运动有效性不匹配时拒绝历史。
+5. **融合当前与历史。** 根据运动和亮度差调整当前帧权重，再进行曝光相关的亮度加权融合。转回 RGB 后加入少量颜色 dither。
+6. **保存结果。** 交换两张历史纹理，记录当前变换，并恢复相机原始投影，供下一帧使用。
+
+历史纹理采用 RGBA16F。RGB 保存颜色，alpha 保存运动写入有效性标记。运动向量和历史差异的调试画面单独输出，不写入历史。
+
+## 四相位 jitter
+
+像素单位的偏移依次为：
 
 ```ts
-const velocityPass = new VelocityPass();
-const taaEffect = new TAAEffect(scene, camera, velocityPass);
-
-const composer = new EffectComposer(renderer);
-composer.addPass(new EffectPass(camera, taaEffect));
+const jitter = [
+  [-0.125, -0.375],
+  [ 0.375, -0.125],
+  [ 0.125,  0.375],
+  [-0.375,  0.125],
+];
 ```
 
-这里把 `TAAEffect` 挂进后处理管线，而不是单独手动调一个 pass。`VelocityPass` 没有直接进 composer，它由 `TAAEffect` 内部驱动。
+这组数值已通过鸣潮的八份连续捕获 `wuwa_taa_01` 至 `wuwa_taa_08` 核对：原始帧号为 **6983–6990**，相位按 `0 → 1 → 2 → 3` 重复两轮，且每帧均与投影矩阵中的偏移一致。
+
+捕获中的像素 Y 方向向下。应用到 WebGL 投影时，偏移转换为：
 
 ```ts
-const animate = (): void => {
-  requestAnimationFrame(animate);
-  controls.update();
-  camera.updateProjectionMatrix();
-  composer.render();
-};
+ndcX =  2 * jitterX / width;
+ndcY = -2 * jitterY / height;
 ```
 
-每帧真正触发 TAA 的入口就是 `composer.render()`。`controls.update()` 和 `camera.updateProjectionMatrix()` 保证当前帧相机状态是最新的，这会直接影响后面 velocity 计算和历史重投影坐标。
+上述结果确认了该段捕获使用的采样序列，不能据此确定游戏 CPU 端是查表还是通过公式生成偏移。投影 jitter 与输出颜色 dither 是不同操作。
 
----
+## 参数与交互
 
-### 2）`TAAEffect`：参数桥接和最终输出
+| 控制项 | 默认值 | 作用 |
+| --- | --- | --- |
+| Enable TAA | 开启 | 启用时间抗锯齿 |
+| Current Frame Weight | 0.25 | 当前帧的基础权重；实际融合比例还受运动和亮度影响 |
+| Jitter Scale | 1.0 | 缩放子像素偏移幅度 |
+| Bicubic History Sampling | 开启 | 使用 Catmull–Rom 历史重建；关闭后使用双线性采样 |
+| Show Motion Vectors | 关闭 | 显示运动向量 |
+| Show History Diff | 关闭 | 显示当前颜色与受限历史颜色的差异 |
+| Reset History | — | 清空时间累积状态 |
+| Toggle Auto-Rotate | 动画开启 | 暂停或恢复场景动画 |
 
-```ts
-this.temporalReprojectPass.taaEnabled = this.taaEnabled;
-this.temporalReprojectPass.blendFactor = this.blendFactor;
-this.temporalReprojectPass.clipGamma = this.clipGamma;
-this.temporalReprojectPass.jitterScale = this.jitterScale;
-this.temporalReprojectPass.showVelocity = this.showVelocity;
-this.temporalReprojectPass.showDiff = this.showDiff;
-```
+拖动鼠标旋转视角，滚轮缩放。按 **G** 导出地板棋盘纹理。
 
-这段是参数桥接层：UI 改的是 `TAAEffect` 上的字段，真正参与 shader 计算的是 `TemporalReprojectPass` 上的字段。每帧同步一次可以保证参数改动立即生效。
+代码中还提供：
 
-```ts
-this.temporalReprojectPass.render(renderer, inputBuffer ?? null, null);
-this.uniforms.get('accumulatedTexture')!.value = this.temporalReprojectPass.texture;
-```
+- `TAAEffect.exposure`：默认 `1`，用于融合时的亮度权重。
+- `TAAEffect.responsiveMask`：可选浮点纹理，保存整数 stencil 值；掩码 `8` 对应的位用于触发响应式权重。
+- `mesh.userData.taaMotionWriter = true`：将已知动态网格标记为运动向量写入对象。自动检测到运动的网格在停止后也会保留该身份。
 
-第一行执行时域累积，第二行把累积结果绑定给 Effect 的采样纹理 `accumulatedTexture`，供最后输出阶段读取。
+## 代码结构
 
-```glsl
-vec3 color = texture2D(accumulatedTexture, uv).rgb;
-color = pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
-outputColor = vec4(color, 1.0);
-```
+| 文件 | 职责 |
+| --- | --- |
+| `src/main.ts` | 应用入口、相机交互和场景动画 |
+| `src/SceneBuilder.ts` | 演示场景、材质与光源 |
+| `src/TaaUi.ts` | 参数面板 |
+| `src/TAAEffect.ts` | 后处理接入、参数转发和最终 gamma 输出 |
+| `src/TemporalReprojectPass.ts` | jitter、相机历史、渲染目标和历史纹理交换 |
+| `src/VelocityPass.ts` | 不透明刚体网格的运动向量与有效性 |
+| `src/TemporalResolveMaterial.ts` | 历史采样、颜色限制、权重计算和融合 shader |
 
-这里做的事情很直接：从累积纹理采样，做一次 gamma 变换，再写屏幕。`max(color, 0)` 用来避免负值参与幂运算。
+## 适配范围
 
----
+本项目复现的是 TAA 的核心处理流程。场景、材质、光照和输出处理由示例提供，因此不能作为鸣潮画面的逐像素复现。
 
-### 3）`TemporalReprojectPass` 每帧流程
+当前运动向量实现支持不透明刚体网格。骨骼动画、形态动画、实例化、透明、alpha cutout 和自定义顶点变形，需要对应的上一帧变形数据与覆盖率处理。
 
-看 `src/TemporalReprojectPass.ts` 的 `render()`。
-
-#### TAA 关闭分支
-
-```ts
-if (!this.taaEnabled) {
-  clearJitter(this.cameraRef);
-  renderer.setRenderTarget(this.sceneTarget);
-  renderer.clear(true, true, true);
-  renderer.render(this.sceneRef, this.cameraRef);
-
-  this.copyMat.uniforms.tDiffuse.value = this.sceneTarget.texture;
-  this.blit(renderer, this.copyMat, this.resolveTarget);
-
-  this.frame += 1;
-  return;
-}
-```
-
-关闭 TAA 时，不读 history，不算 velocity，只渲染当前帧。`clearJitter` 放在前面是为了避免上一帧残留的视口偏移污染当前直出结果。
-
-#### TAA 开启分支
-
-1. 计算当前帧 VP 和逆矩阵。
-2. 应用 jitter。
-3. 渲染当前帧 color + depth。
-4. 清除 jitter。
-5. 基于 depth 计算 velocity。
-6. 用当前帧和历史帧做 resolve。
-7. 把 resolve 结果复制到 historyB。
-8. 交换 historyA/historyB。
-
-```ts
-this.currViewProj.multiplyMatrices(this.cameraRef.projectionMatrix, this.cameraRef.matrixWorldInverse);
-this.invViewProj.copy(this.currViewProj).invert();
-
-this.applyJitter();
-
-renderer.setRenderTarget(this.sceneTarget);
-renderer.clear(true, true, true);
-renderer.render(this.sceneRef, this.cameraRef);
-
-clearJitter(this.cameraRef);
-
-const depthTexture = this.sceneTarget.depthTexture;
-this.velocityPass.setFrameData(depthTexture, this.invViewProj, this.currViewProj);
-this.velocityPass.render(renderer, null, null);
-
-uniforms.tColor.value = this.sceneTarget.texture;
-uniforms.tVelocity.value = this.velocityPass.texture;
-uniforms.tDepth.value = depthTexture;
-uniforms.tHistory.value = this.histA.texture;
-this.blit(renderer, this.resolveMat, this.resolveTarget);
-
-this.copyMat.uniforms.tDiffuse.value = this.resolveTarget.texture;
-this.blit(renderer, this.copyMat, this.histB);
-
-[this.histA, this.histB] = [this.histB, this.histA];
-this.frame += 1;
-```
-
-这段里有三个关键点：
-
-- `tHistory` 永远读 `histA`，本帧结果永远写 `histB`，最后交换引用，形成 ping-pong。
-- `velocityPass` 用当前帧 depth + 当前/上一帧矩阵关系算重投影偏移。
-- `frame += 1` 不只是计数，也影响 jitter 序列索引。
-
----
-
-### 4）Jitter
-
-```ts
-const R2 = Array.from({ length: 256 }, (_, n) => [
-  (BASE + A1 * n) % 1 - 0.5,
-  (BASE + A2 * n) % 1 - 0.5,
-]);
-```
-
-这里预生成了 256 组低差异采样点，分布比纯随机更均匀。`-0.5` 把范围平移到以 0 为中心，便于做正负方向偏移。
-
-```ts
-const [x, y] = R2[this.frame % R2.length];
-this.cameraRef.setViewOffset(
-  this.width,
-  this.height,
-  x * this.jitterScale,
-  y * this.jitterScale,
-  this.width,
-  this.height,
-);
-```
-
-`frame % R2.length` 让采样序列循环使用。`jitterScale` 是实际偏移幅度开关，调大能增强超采样效果，但也更依赖稳定的 history 约束。
-
-```ts
-function clearJitter(camera: PerspectiveCamera): void {
-  camera.clearViewOffset();
-}
-```
-
-每帧渲染完都要清除，否则后续相机使用会带着偏移继续跑，导致坐标体系不一致。
-
----
-
-### 5）`VelocityPass`：由 depth 反推速度
-
-```glsl
-vec3 reconstructWorldPos(vec2 uv, float depth) {
-  float z = depth * 2.0 - 1.0;
-  vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
-  vec4 wp = uInvViewProj * clip;
-  return wp.xyz / wp.w;
-}
-```
-
-这段做的是从屏幕空间反推世界坐标。输入是当前像素的 `uv + depth`，通过 `invViewProj` 回到世界空间，为“投到上一帧”做准备。
-
-```glsl
-float closestDepth = 1.0;
-vec2 closestUV = vUv;
-
-for (int x = -1; x <= 1; x++) {
-  for (int y = -1; y <= 1; y++) {
-    vec2 sUV = vUv + vec2(float(x), float(y)) * uInvTexSize;
-    float d = texture2D(tDepth, sUV).r;
-    if (d < closestDepth) {
-      closestDepth = d;
-      closestUV = sUV;
-    }
-  }
-}
-```
-
-这里不是直接用中心像素深度，而是查 3×3 邻域最前面的深度点。边缘区域这么做通常更稳定，可以减轻前后景交界处的速度误判。
-
-```glsl
-vec3 wp = reconstructWorldPos(closestUV, closestDepth);
-vec4 prevClip = uPrevViewProj * vec4(wp, 1.0);
-vec2 prevUV = prevClip.xy / prevClip.w * 0.5 + 0.5;
-vec2 velocity = closestUV - prevUV;
-gl_FragColor = vec4(velocity, 0.0, 1.0);
-```
-
-同一个世界点在上一帧的屏幕位置是 `prevUV`，当前帧位置是 `closestUV`，两者差值就是 motion vector。
-
----
-
-### 6）Resolve Shader：时域融合与抗鬼影
-
-对应 `TemporalReprojectPass.ts` 里的 `createResolveMaterial().fragmentShader`。
-
-```glsl
-vec2 historyUV = vUv - velocity;
-if (historyUV.x < 0.0 || historyUV.x > 1.0 || historyUV.y < 0.0 || historyUV.y > 1.0) {
-  gl_FragColor = vec4(currentColor, 1.0);
-  return;
-}
-```
-
-先根据 velocity 找到历史帧采样位置。越界时直接退化为当前帧，避免读到非法区域导致拖影。
-
-```glsl
-vec3 historyColor = BiCubicCatmullRom5Tap(tHistory, historyUV, uInvTexSize).rgb;
-```
-
-历史采样用 Catmull-Rom 5 tap，不是单点采样。这样历史重建更平滑，细节保留也更好。
-
-```glsl
-vec3 mu = m1 / 9.0;
-vec3 sigma = sqrt(abs(m2 / 9.0 - mu * mu));
-vec3 cMin = mu - uClipGamma * sigma;
-vec3 cMax = mu + uClipGamma * sigma;
-vec3 clippedHistoryTonemappedYCoCg = ClipAABBToCenter(historyTonemappedYCoCg, cMin, cMax);
-```
-
-
-在做统计裁剪前，shader 还做了两步颜色预处理：
-
-- 先做 `ToneMapSimple`，把过亮值压缩到更稳定的范围，降低高亮像素对均值/方差的干扰。
-- 再做 `RGB -> YCoCg`，把亮度（Y）和色度（Co/Cg）拆开，裁剪时可以对亮度和色度分别处理。
-
-`YCoCg` 可以理解为一种便于做时域稳定处理的颜色空间：
-
-- `Y` 近似亮度分量，最影响闪烁感；
-- `Co/Cg` 是色差信息，通常变化幅度比亮度小。
-
-本项目在裁剪时会额外收紧色度范围（`cMin.yz / cMax.yz` 按 `chromaExtent` 限制），这样做的目的，是避免历史颜色在色彩方向漂得太远，减少彩边和色偏鬼影。
-
-裁剪结束后，再通过 `YCoCg -> RGB` 和 `UnToneMapSimple` 回到用于最终混合的颜色空间。
-
-```glsl
-float diff = abs(lum0 - lum1) / max(lum0, max(lum1, 0.2));
-float w = 1.0 - diff;
-float kFeedback = mix(1.0 - uBlendFactor * 2.0, 1.0 - uBlendFactor * 0.5, w * w);
-vec3 result = mix(currentColor, historyColor, kFeedback);
-```
-
-最后做自适应混合：当前帧和历史帧亮度越接近，`kFeedback` 越大，历史权重越高；差异越大，系统越偏向当前帧，降低错误历史的影响。
-
----
-
-### 7）资源生命周期：初始化 / resize / reset
-
-```ts
-this.sceneTarget = new WebGLRenderTarget(width, height, {
-  minFilter: LinearFilter,
-  magFilter: LinearFilter,
-  type: HalfFloatType,
-  depthTexture: depthTex,
-});
-
-this.histA = new WebGLRenderTarget(width, height, historyOptions);
-this.histB = new WebGLRenderTarget(width, height, historyOptions);
-this.resolveTarget = new WebGLRenderTarget(width, height, {
-  minFilter: LinearFilter,
-  magFilter: LinearFilter,
-  type: HalfFloatType,
-});
-
-this.velocityPass.setSize(width, height);
-this.frame = 0;
-```
-
-`sceneTarget` 同时存 color 和 depth。`histA/histB` 存时域历史。`resolveTarget` 存本帧融合结果。尺寸变化时整套 RT 会重建，并把 `frame` 归零，防止旧历史跨分辨率污染新帧。
-
-```ts
-window.addEventListener('resize', () => {
-  camera.aspect = width / height;
-  camera.updateProjectionMatrix();
-  renderer.setSize(width, height);
-  composer.setSize(width, height);
-});
-```
-
-窗口变化时，这里会把相机、renderer、composer 一起更新。最终会传导到 `TemporalReprojectPass.setSize()`，保持纹理尺寸一致。
-
-```ts
-reset(): void {
-  this.frame = 0;
-  this.velocityPass.reset();
-}
-```
-
-重置 history 时，不只清帧号，也清 velocity 历史矩阵状态。这样切换参数或镜头突变后能更快回到稳定状态。
-
----
-
-### 8）UI 参数与效果对应
-
-| 参数 | 字段 | 作用 |
-|---|---|---|
-| Enable TAA | `taaEnabled` | 开关历史融合，关闭后退化为当前帧直出 |
-| Blend Factor | `blendFactor` | 控制历史反馈强度，越大越偏向当前帧 |
-| Variance Clip Gamma | `clipGamma` | 控制历史裁剪宽度，越小越严格 |
-| Jitter Scale | `jitterScale` | 控制亚像素抖动幅度 |
-| Show Motion Vectors | `showVelocity` | 显示速度图调试视图 |
-| Show History Diff | `showDiff` | 显示当前帧与历史帧差异 |
-
----
-
-### 9）一帧数据流
-
-```mermaid
-flowchart TD
-    A[Scene + Camera] --> B[apply jitter]
-    B --> C[render scene to sceneTarget <br/> color + depth]
-    C --> D[clear jitter]
-    D --> E[VelocityPass]
-    E --> F[Resolve]
-    F --> G[CatmullRom + VarianceClip <br/> + Feedback]
-    G --> H[resolveTarget to historyB]
-    H --> I[swap historyA/historyB, frame++]
-    I --> J[TAAEffect mainImage]
-```
-
-```text
-Scene + Camera
-  ├─ apply jitter
-  ├─ render current color+depth -> sceneTarget
-  ├─ clear jitter
-  ├─ depth + matrix -> VelocityPass -> velocityTex
-  ├─ Resolve(current, historyA, velocity, depth)
-  │    └─ CatmullRom + VarianceClip + Feedback
-  ├─ resolveTarget -> copy -> historyB
-  └─ swap(historyA, historyB), frame++
-
-TAAEffect(mainImage): accumulatedTexture -> gamma -> screen
-```
-
----
-
-## Reference
-- [TAA tutorial](https://docs.google.com/document/d/15z2Vp-24S69jiZnxqSHb9dX-A-o4n3tYiPQOCRkCt5Q/edit#)
-- [Temporal AA Anti-Flicker](https://zhuanlan.zhihu.com/p/71173025)
-- [HIGH-QUALITY TEMPORAL SUPERSAMPLING - Brian Karis (Epic Games, Inc.)](http://advances.realtimerendering.com/s2014/#_HIGH-QUALITY_TEMPORAL_SUPERSAMPLING)
-- [An Excursion in Temporal Supersampling - NVDIA](https://developer.download.nvidia.cn/gameworks/events/GDC2016/msalvi_temporal_supersampling.pdf)
-- [Temporal Reprojection Anti-Aliasing in INSIDE](http://twvideo01.ubm-us.net/o1/vault/gdc2016/Presentations/Pedersen_LasseJonFuglsang_TemporalReprojectionAntiAliasing.pdf)
+相机突变、分辨率变化、TAA 开关、采样方式或 jitter 幅度变化时会重置历史。示例每个动画帧只执行一次 TAA，以保持历史和变换一致。

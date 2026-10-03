@@ -4,12 +4,11 @@ export interface TaaUiElements {
   enableTAA: HTMLInputElement;
   blendFactor: HTMLInputElement;
   blendVal: HTMLSpanElement;
-  clipGamma: HTMLInputElement;
-  clipVal: HTMLSpanElement;
   jitterScale: HTMLInputElement;
   jitterVal: HTMLSpanElement;
   showVelocity: HTMLInputElement;
   showDiff: HTMLInputElement;
+  useBicubicHistorySampling: HTMLInputElement;
   resetHistory: HTMLButtonElement;
   toggleRotate: HTMLButtonElement;
   fpsEl: HTMLSpanElement;
@@ -32,12 +31,8 @@ export function mountTaaUi(root: HTMLElement): TaaUiElements {
           <input type="checkbox" id="enableTAA" checked /> Enable TAA
         </label>
         <label>
-          Blend Factor: <span class="val" id="blendVal">0.05</span>
-          <input type="range" id="blendFactor" min="0.01" max="0.2" step="0.01" value="0.05" />
-        </label>
-        <label>
-          Variance Clip Gamma: <span class="val" id="clipVal">1.0</span>
-          <input type="range" id="clipGamma" min="0.5" max="3.0" step="0.1" value="1.0" />
+          Current Frame Weight: <span class="val" id="blendVal">0.25</span>
+          <input type="range" id="blendFactor" min="0.01" max="1.0" step="0.01" value="0.25" />
         </label>
         <label>
           Jitter Scale: <span class="val" id="jitterVal">1.0</span>
@@ -48,6 +43,9 @@ export function mountTaaUi(root: HTMLElement): TaaUiElements {
         </label>
         <label>
           <input type="checkbox" id="showDiff" /> Show History Diff
+        </label>
+        <label>
+          <input type="checkbox" id="useBicubicHistorySampling" checked /> Bicubic History Sampling
         </label>
         <hr class="panel-divider" />
         <button id="resetHistory">Reset History</button>
@@ -65,12 +63,11 @@ export function mountTaaUi(root: HTMLElement): TaaUiElements {
     enableTAA: getElement<HTMLInputElement>(root, 'enableTAA'),
     blendFactor: getElement<HTMLInputElement>(root, 'blendFactor'),
     blendVal: getElement<HTMLSpanElement>(root, 'blendVal'),
-    clipGamma: getElement<HTMLInputElement>(root, 'clipGamma'),
-    clipVal: getElement<HTMLSpanElement>(root, 'clipVal'),
     jitterScale: getElement<HTMLInputElement>(root, 'jitterScale'),
     jitterVal: getElement<HTMLSpanElement>(root, 'jitterVal'),
     showVelocity: getElement<HTMLInputElement>(root, 'showVelocity'),
     showDiff: getElement<HTMLInputElement>(root, 'showDiff'),
+    useBicubicHistorySampling: getElement<HTMLInputElement>(root, 'useBicubicHistorySampling'),
     resetHistory: getElement<HTMLButtonElement>(root, 'resetHistory'),
     toggleRotate: getElement<HTMLButtonElement>(root, 'toggleRotate'),
     fpsEl: getElement<HTMLSpanElement>(root, 'fps'),

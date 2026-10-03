@@ -25,6 +25,7 @@ interface TestSceneObjects {
   sphere: Mesh;
   torus: Mesh;
   wireSphere: Mesh;
+  groundCanvas: HTMLCanvasElement;
 }
 
 export function buildTestScene(): TestSceneObjects {
@@ -33,6 +34,7 @@ export function buildTestScene(): TestSceneObjects {
 
   const groundGeo = new PlaneGeometry(40, 40);
   const groundCanvas = createCheckerboardCanvas(512, 512, 16, 0xffffff, 0x222222);
+
   const groundTex = new CanvasTexture(groundCanvas);
   groundTex.wrapS = groundTex.wrapT = RepeatWrapping;
   groundTex.magFilter = NearestFilter;
@@ -104,7 +106,7 @@ export function buildTestScene(): TestSceneObjects {
   pointLight2.position.set(3, 2, -3);
   scene.add(pointLight2);
 
-  return { scene, group, cube1, cube2, sphere, torus, wireSphere };
+  return { scene, group, cube1, cube2, sphere, torus, wireSphere, groundCanvas };
 }
 
 function createCheckerboardCanvas(
