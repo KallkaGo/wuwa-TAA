@@ -16,6 +16,7 @@ import {
   SphereGeometry,
   TorusGeometry,
 } from 'three';
+import { buildSkinnedDemo } from './SkinnedDemo';
 
 interface TestSceneObjects {
   scene: Scene;
@@ -25,7 +26,9 @@ interface TestSceneObjects {
   sphere: Mesh;
   torus: Mesh;
   wireSphere: Mesh;
+  transparentSphere: Mesh;
   groundCanvas: HTMLCanvasElement;
+  animateSkin: (time: number) => void;
 }
 
 export function buildTestScene(): TestSceneObjects {
@@ -47,6 +50,9 @@ export function buildTestScene(): TestSceneObjects {
   const group = new Group();
   scene.add(group);
 
+  const skinnedDemo = buildSkinnedDemo();
+  scene.add(skinnedDemo.mesh);
+
   const cube1Geo = new BoxGeometry(1.2, 1.2, 1.2);
   const cube1Mat = new MeshStandardMaterial({ color: 0xff2244, roughness: 0.3, metalness: 0.1 });
   const cube1 = new Mesh(cube1Geo, cube1Mat);
@@ -64,6 +70,16 @@ export function buildTestScene(): TestSceneObjects {
   const sphere = new Mesh(sphereGeo, sphereMat);
   sphere.position.set(-2.0, 0.5, 1.0);
   group.add(sphere);
+
+  // Alpha-blended color enters TAA; depth and motion remain those of the surfaces behind it.
+  const transparentSphere = new Mesh(
+    new SphereGeometry(0.75, 32, 24),
+    new MeshStandardMaterial({
+      color: 0xff66dd, roughness: 0.35, transparent: true, opacity: 0.4, depthWrite: false,
+    }),
+  );
+  transparentSphere.position.set(0.5, -0.2, 2.5);
+  scene.add(transparentSphere);
 
   const torusGeo = new TorusGeometry(0.7, 0.25, 24, 48);
   const torusMat = new MeshStandardMaterial({ color: 0xffcc00, roughness: 0.3, metalness: 0.5 });
@@ -106,7 +122,7 @@ export function buildTestScene(): TestSceneObjects {
   pointLight2.position.set(3, 2, -3);
   scene.add(pointLight2);
 
-  return { scene, group, cube1, cube2, sphere, torus, wireSphere, groundCanvas };
+  return { scene, group, cube1, cube2, sphere, torus, wireSphere, transparentSphere, groundCanvas, animateSkin: skinnedDemo.animate };
 }
 
 function createCheckerboardCanvas(

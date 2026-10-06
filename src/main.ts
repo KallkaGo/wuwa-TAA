@@ -33,7 +33,7 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.05;
 controls.target.set(0, 0, 0);
 
-const { scene, group, cube1, cube2, sphere, torus, wireSphere, groundCanvas } = buildTestScene();
+const { scene, group, cube1, cube2, sphere, torus, wireSphere, transparentSphere, groundCanvas, animateSkin } = buildTestScene();
 
 // These animated primitives remain velocity writers even while animation is paused.
 for (const mesh of [cube1, cube2, sphere, torus, wireSphere]) mesh.userData.taaMotionWriter = true;
@@ -88,6 +88,11 @@ ui.useBicubicHistorySampling.addEventListener('change', () => {
   taaEffect.useBicubicHistorySampling = ui.useBicubicHistorySampling.checked;
 });
 
+ui.showTransparentTest.addEventListener('change', () => {
+  transparentSphere.visible = ui.showTransparentTest.checked;
+  taaEffect.resetHistory();
+});
+
 ui.resetHistory.addEventListener('click', () => {
   taaEffect.resetHistory();
 });
@@ -121,6 +126,7 @@ const animate = (): void => {
 
   if (autoRotate) {
     const t = now * 0.001;
+    animateSkin(t);
     group.rotation.y += 0.005;
     cube1.rotation.x = t * 0.7;
     cube1.rotation.z = t * 0.5;
@@ -128,6 +134,7 @@ const animate = (): void => {
     torus.rotation.x = t * 1.2;
     wireSphere.rotation.y = t * 0.8;
     sphere.position.y = 0.5 + Math.sin(t) * 0.3;
+    transparentSphere.position.x = 0.5 + Math.sin(t * 1.2) * 1.8;
   }
 
   controls.update();

@@ -1,5 +1,7 @@
 import {
   Color,
+  DataTexture,
+  FloatType,
   HalfFloatType,
   Matrix4,
   Mesh,
@@ -8,6 +10,7 @@ import {
   PerspectiveCamera,
   Scene,
   ShaderMaterial,
+  SkinnedMesh,
   WebGLRenderTarget,
   type Material,
   type Texture,
@@ -27,6 +30,9 @@ class VelocityMaterial extends ShaderMaterial {
         uCurrentViewProj: { value: new Matrix4() },
         uPreviousViewProj: { value: new Matrix4() },
         uPreviousWorld: { value: new Matrix4() },
+        uPreviousBoneTexture: { value: null },
+        uPreviousBindMatrix: { value: new Matrix4() },
+        uPreviousBindMatrixInverse: { value: new Matrix4() },
         uHistoryValid: { value: 0.0 },
         uMotionWriter: { value: 0.0 },
       },
@@ -38,12 +44,44 @@ class VelocityMaterial extends ShaderMaterial {
         varying vec4 vCurrentClip;
         varying vec4 vPreviousClip;
 
+        #include <skinning_pars_vertex>
+        #ifdef USE_SKINNING
+          uniform highp sampler2D uPreviousBoneTexture;
+          uniform mat4 uPreviousBindMatrix;
+          uniform mat4 uPreviousBindMatrixInverse;
+
+          mat4 previousBoneMatrix(float index) {
+            int size = textureSize(uPreviousBoneTexture, 0).x;
+            int j = int(index) * 4;
+            ivec2 p = ivec2(j % size, j / size);
+            return mat4(
+              texelFetch(uPreviousBoneTexture, p, 0),
+              texelFetch(uPreviousBoneTexture, p + ivec2(1, 0), 0),
+              texelFetch(uPreviousBoneTexture, p + ivec2(2, 0), 0),
+              texelFetch(uPreviousBoneTexture, p + ivec2(3, 0), 0)
+            );
+          }
+        #endif
+
         void main() {
-          vec4 localPosition = vec4(position, 1.0);
+          vec3 transformed = position;
+          #include <skinbase_vertex>
+          #include <skinning_vertex>
+          vec4 localPosition = vec4(transformed, 1.0);
+          vec4 previousLocalPosition = vec4(position, 1.0);
+          #ifdef USE_SKINNING
+            vec4 previousSkinVertex = uPreviousBindMatrix * previousLocalPosition;
+            vec4 previousSkinned =
+              previousBoneMatrix(skinIndex.x) * previousSkinVertex * skinWeight.x +
+              previousBoneMatrix(skinIndex.y) * previousSkinVertex * skinWeight.y +
+              previousBoneMatrix(skinIndex.z) * previousSkinVertex * skinWeight.z +
+              previousBoneMatrix(skinIndex.w) * previousSkinVertex * skinWeight.w;
+            previousLocalPosition = vec4((uPreviousBindMatrixInverse * previousSkinned).xyz, 1.0);
+          #endif
           vec4 worldPosition = modelMatrix * localPosition;
           gl_Position = uJitteredViewProj * worldPosition;
           vCurrentClip = uCurrentViewProj * worldPosition;
-          vPreviousClip = uPreviousViewProj * uPreviousWorld * localPosition;
+          vPreviousClip = uPreviousViewProj * uPreviousWorld * previousLocalPosition;
         }
       `,
       fragmentShader: /* glsl */ `
@@ -60,7 +98,7 @@ class VelocityMaterial extends ShaderMaterial {
 
           vec2 currentUV = vCurrentClip.xy / vCurrentClip.w * 0.5 + 0.5;
           vec2 previousUV = vPreviousClip.xy / vPreviousClip.w * 0.5 + 0.5;
-          // B marks an explicit rigid-object motion writer; the resolver reconstructs camera-only motion.
+          // B marks an object-motion writer; the resolver reconstructs camera-only motion.
           gl_FragColor = vec4(currentUV - previousUV, uMotionWriter, 1.0);
         }
       `,
@@ -74,11 +112,19 @@ interface MotionEntry {
   previousWorld: Matrix4;
   hasHistory: boolean;
   motionWriter: boolean;
+  skinHistory?: {
+    skeleton: SkinnedMesh['skeleton'];
+    bones: SkinnedMesh['skeleton']['bones'];
+    texture: DataTexture;
+    matrices: Float32Array;
+    bindMatrix: Matrix4;
+    bindMatrixInverse: Matrix4;
+  };
 }
 
 /**
- * Motion for the demo's opaque rigid meshes. Shares geometry without modifying source objects.
- * Skinning, morphs, instancing and cutouts are skipped; custom vertex deformation is unsupported.
+ * Motion for opaque rigid and skinned meshes. Shares geometry without replacing source objects.
+ * Morphs, instancing and cutouts are skipped; custom vertex deformation is unsupported.
  * RG is current-minus-previous unjittered UV; B identifies an explicit object-motion writer.
  * A writer stays valid when it stops moving. Rasterization alone uses the jittered projection.
  */
@@ -143,16 +189,25 @@ export class VelocityPass extends Pass {
     const activeMeshes = new Set<Mesh>();
     scene.traverseVisible((object) => {
       if (!(object instanceof Mesh) || !object.layers.test(camera.layers)) return;
-      const specialized = object as Mesh & { isSkinnedMesh?: boolean; isInstancedMesh?: boolean };
-      if (specialized.isSkinnedMesh || specialized.isInstancedMesh ||
+      const specialized = object as Mesh & { isInstancedMesh?: boolean };
+      if (specialized.isInstancedMesh ||
           Object.keys(object.geometry.morphAttributes).length > 0) return;
 
       const sourceMaterials = Array.isArray(object.material) ? object.material : [object.material];
       if (!sourceMaterials.some(isSupportedMaterial)) return;
       activeMeshes.add(object);
       let entry = this.entries.get(object);
+      const skin = object instanceof SkinnedMesh ? object : null;
+      // A different vertex layout or bone mapping has no corresponding previous pose.
+      if (entry && (entry.proxy.geometry !== object.geometry ||
+          (skin && (!entry.skinHistory || entry.skinHistory.skeleton !== skin.skeleton ||
+            entry.skinHistory.bones.length !== skin.skeleton.bones.length ||
+            entry.skinHistory.bones.some((bone, i) => bone !== skin.skeleton.bones[i]))))) {
+        this.removeEntry(object, entry);
+        entry = undefined;
+      }
       if (!entry) {
-        const proxy = new Mesh(object.geometry, []);
+        const proxy = skin ? new SkinnedMesh(object.geometry, []) : new Mesh(object.geometry, []);
         proxy.matrixAutoUpdate = false;
         proxy.matrixWorldAutoUpdate = false;
         entry = {
@@ -160,8 +215,18 @@ export class VelocityPass extends Pass {
           materials: [],
           previousWorld: new Matrix4(),
           hasHistory: false,
-          motionWriter: object.userData.taaMotionWriter === true,
+          motionWriter: !!skin || object.userData.taaMotionWriter === true,
         };
+        if (skin) {
+          const size = Math.max(4, Math.ceil(Math.sqrt(skin.skeleton.bones.length * 4) / 4) * 4);
+          const matrices = new Float32Array(size * size * 4);
+          const texture = new DataTexture(matrices, size, size, undefined, FloatType);
+          texture.needsUpdate = true;
+          entry.skinHistory = {
+            skeleton: skin.skeleton, bones: skin.skeleton.bones.slice(), texture, matrices,
+            bindMatrix: new Matrix4(), bindMatrixInverse: new Matrix4(),
+          };
+        }
         this.entries.set(object, entry);
         this.motionScene.add(proxy);
       }
@@ -175,6 +240,17 @@ export class VelocityPass extends Pass {
       entry.proxy.layers.mask = object.layers.mask;
       entry.proxy.frustumCulled = object.frustumCulled;
       entry.proxy.renderOrder = object.renderOrder;
+      if (skin && entry.proxy instanceof SkinnedMesh) {
+        entry.proxy.skeleton = skin.skeleton;
+        entry.proxy.bindMode = skin.bindMode;
+        entry.proxy.bindMatrix.copy(skin.bindMatrix);
+        entry.proxy.bindMatrixInverse.copy(skin.bindMatrixInverse);
+        // Match the color pass's skinned bounds, rather than the undeformed geometry bounds.
+        entry.proxy.boundingSphere = skin.boundingSphere;
+        // Also capture a fresh pose when the source was outside the color pass's frustum.
+        if (!skin.skeleton.boneTexture) skin.skeleton.computeBoneTexture();
+        skin.skeleton.update();
+      }
 
       const validHistory = this.hasHistory && entry.hasHistory;
       const objectMoved = validHistory && !entry.previousWorld.equals(object.matrixWorld);
@@ -197,15 +273,21 @@ export class VelocityPass extends Pass {
         material.uniforms.uPreviousWorld.value.copy(validHistory ? entry.previousWorld : object.matrixWorld);
         material.uniforms.uHistoryValid.value = validHistory ? 1.0 : 0.0;
         material.uniforms.uMotionWriter.value = validHistory && entry.motionWriter ? 1.0 : 0.0;
+        if (skin && entry.skinHistory) {
+          material.uniforms.uPreviousBoneTexture.value = validHistory
+            ? entry.skinHistory.texture : skin.skeleton.boneTexture;
+          material.uniforms.uPreviousBindMatrix.value.copy(validHistory
+            ? entry.skinHistory.bindMatrix : skin.bindMatrix);
+          material.uniforms.uPreviousBindMatrixInverse.value.copy(validHistory
+            ? entry.skinHistory.bindMatrixInverse : skin.bindMatrixInverse);
+        }
       }
     });
 
     // Dropping invisible or removed objects also prevents stale motion when they reappear.
     for (const [source, entry] of this.entries) {
       if (!activeMeshes.has(source)) {
-        this.motionScene.remove(entry.proxy);
-        for (const material of entry.materials) material.dispose();
-        this.entries.delete(source);
+        this.removeEntry(source, entry);
       }
     }
     this.hasFrameData = true;
@@ -246,6 +328,13 @@ export class VelocityPass extends Pass {
     this.previousViewProj.copy(this.currentViewProj);
     for (const entry of this.entries.values()) {
       entry.previousWorld.copy(entry.proxy.matrixWorld);
+      if (entry.skinHistory && entry.proxy instanceof SkinnedMesh) {
+        const history = entry.skinHistory;
+        history.matrices.set(history.skeleton.boneMatrices.subarray(0, history.bones.length * 16));
+        history.texture.needsUpdate = true;
+        history.bindMatrix.copy(entry.proxy.bindMatrix);
+        history.bindMatrixInverse.copy(entry.proxy.bindMatrixInverse);
+      }
       entry.hasHistory = true;
     }
     this.hasHistory = true;
@@ -255,14 +344,18 @@ export class VelocityPass extends Pass {
   dispose(): void {
     this.rt?.dispose();
     this.rt = null;
-    for (const entry of this.entries.values()) {
-      for (const material of entry.materials) material.dispose();
-    }
-    this.entries.clear();
+    for (const [source, entry] of this.entries) this.removeEntry(source, entry);
     this.motionScene.clear();
     this.hasFrameData = false;
     // Shared source geometries belong to the original scene and are not disposed here.
     super.dispose();
+  }
+
+  private removeEntry(source: Mesh, entry: MotionEntry): void {
+    this.motionScene.remove(entry.proxy);
+    for (const material of entry.materials) material.dispose();
+    entry.skinHistory?.texture.dispose();
+    this.entries.delete(source);
   }
 }
 

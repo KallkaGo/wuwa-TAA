@@ -9,6 +9,7 @@ export interface TaaUiElements {
   showVelocity: HTMLInputElement;
   showDiff: HTMLInputElement;
   useBicubicHistorySampling: HTMLInputElement;
+  showTransparentTest: HTMLInputElement;
   resetHistory: HTMLButtonElement;
   toggleRotate: HTMLButtonElement;
   fpsEl: HTMLSpanElement;
@@ -48,6 +49,9 @@ export function mountTaaUi(root: HTMLElement): TaaUiElements {
           <input type="checkbox" id="useBicubicHistorySampling" checked /> Bicubic History Sampling
         </label>
         <hr class="panel-divider" />
+        <label>
+          <input type="checkbox" id="showTransparentTest" checked /> Pink Transparent Sphere (40%)
+        </label>
         <button id="resetHistory">Reset History</button>
         <button id="toggleRotate">Toggle Auto-Rotate</button>
       </div>
@@ -68,6 +72,7 @@ export function mountTaaUi(root: HTMLElement): TaaUiElements {
     showVelocity: getElement<HTMLInputElement>(root, 'showVelocity'),
     showDiff: getElement<HTMLInputElement>(root, 'showDiff'),
     useBicubicHistorySampling: getElement<HTMLInputElement>(root, 'useBicubicHistorySampling'),
+    showTransparentTest: getElement<HTMLInputElement>(root, 'showTransparentTest'),
     resetHistory: getElement<HTMLButtonElement>(root, 'resetHistory'),
     toggleRotate: getElement<HTMLButtonElement>(root, 'toggleRotate'),
     fpsEl: getElement<HTMLSpanElement>(root, 'fps'),
